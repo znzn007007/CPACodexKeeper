@@ -13,7 +13,7 @@ It does not create tokens. Instead, it continuously maintains **existing codex t
 ## Core capabilities
 
 - check whether a token is still valid
-- disable or re-enable tokens based on weekly or primary quota
+- disable or re-enable tokens based on the actual quota windows returned by usage
 - optionally refresh disabled tokens that are close to expiry
 - support `.env` configuration, Docker, and GitHub Actions CI
 
@@ -63,7 +63,7 @@ Each inspection round follows this sequence:
 4. read expiry information and remaining lifetime
 5. call the OpenAI usage endpoint
 6. delete the token if usage returns `401` or `402`, meaning the token is invalid or the workspace is deactivated
-7. if a **weekly quota window** exists, evaluate both `5h` and weekly quota together
+7. if usage returns two quota windows, evaluate them by their actual meaning
 8. disable when either window reaches the threshold, and re-enable only when both drop below it
 9. if the token has **no `refresh_token`** and is already expired, delete it directly
 10. if the token has **no `refresh_token`** and the checked quota reaches the threshold, delete it directly
@@ -82,8 +82,8 @@ The project supports both team and non-team usage responses.
 
 When the usage response includes both windows:
 
-- `rate_limit.primary_window`: usually a shorter window such as 5 hours
-- `rate_limit.secondary_window`: usually the weekly quota window
+- `rate_limit.primary_window`: usually the primary quota window; logs label it from `limit_window_seconds` as `5h`, `Week`, or another appropriate name
+- `rate_limit.secondary_window`: usually the secondary quota window; logs also label it from `limit_window_seconds`
 
 In that case, the program will:
 
@@ -238,7 +238,7 @@ For each token, the tool logs details such as:
 - expiry time
 - remaining lifetime
 - usage check result
-- 5-hour / weekly quota information
+- actual quota window information
 - whether the token was deleted, disabled, enabled, or refreshed
 
 At the end of each round, it prints a summary including:

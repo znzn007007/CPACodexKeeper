@@ -2,6 +2,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def format_window_label(limit_window_seconds: int | None, fallback: str) -> str:
+    if limit_window_seconds == 18000:
+        return "5h"
+    if limit_window_seconds == 604800:
+        return "Week"
+    return fallback
+
+
 @dataclass(slots=True)
 class TokenQuota:
     used_percent: int = 0
@@ -32,7 +40,9 @@ class UsageInfo:
 
     @property
     def quota_check_label(self) -> str:
-        return "week" if self.secondary_used_percent is not None else "5h"
+        if self.secondary_used_percent is not None:
+            return format_window_label(self.secondary_window.limit_window_seconds, "secondary_window")
+        return format_window_label(self.primary_window.limit_window_seconds, "primary_window")
 
 
 @dataclass(slots=True)

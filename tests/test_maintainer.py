@@ -3,7 +3,7 @@ import sys
 import unittest
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -53,7 +53,7 @@ class MaintainerTests(unittest.TestCase):
         self.assertEqual(usage.primary_used_percent, 15)
         self.assertEqual(usage.secondary_used_percent, 80)
         self.assertEqual(usage.quota_check_percent, 80)
-        self.assertEqual(usage.quota_check_label, "week")
+        self.assertEqual(usage.quota_check_label, "Week")
 
     def test_parse_usage_info_falls_back_to_primary_when_secondary_missing(self):
         usage = parse_usage_info({
@@ -68,7 +68,7 @@ class MaintainerTests(unittest.TestCase):
         })
         self.assertEqual(usage.secondary_used_percent, None)
         self.assertEqual(usage.quota_check_percent, 30)
-        self.assertEqual(usage.quota_check_label, "5h")
+        self.assertEqual(usage.quota_check_label, "Week")
 
     def test_process_token_deletes_invalid_token_on_401(self):
         self.maintainer.get_token_detail = Mock(return_value={
@@ -236,10 +236,44 @@ class MaintainerTests(unittest.TestCase):
             "expired": "2099-03-01T00:00:00Z",
         }, "刷新成功"))
         self.maintainer.upload_updated_token = Mock(return_value=True)
+        self.maintainer.set_disabled_status = Mock(return_value=True)
         result = self.maintainer.process_token({"name": "t4"}, 1, 1)
         self.assertEqual(result, "alive")
         self.maintainer.upload_updated_token.assert_called_once()
+        self.maintainer.set_disabled_status.assert_called_once_with("t4", disabled=True, logger=ANY)
         self.assertEqual(self.maintainer.stats.refreshed, 1)
+
+    def test_process_token_logs_week_label_when_primary_window_is_weekly(self):
+        self.maintainer.get_token_detail = Mock(return_value={
+            "email": "a@example.com",
+            "disabled": False,
+            "access_token": "token",
+            "refresh_token": "rt",
+            "account_id": "acc",
+            "expired": "2099-01-01T00:00:00Z",
+        })
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "free",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 100, "limit_window_seconds": 604800},
+                    "secondary_window": None,
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
+        self.maintainer.set_disabled_status = Mock(return_value=True)
+        captured_lines = []
+        self.maintainer.logger.emit_lines = Mock(side_effect=lambda lines: captured_lines.append(list(lines)))
+
+        result = self.maintainer.process_token({"name": "t-week-primary"}, 1, 1)
+
+        self.assertEqual(result, "alive")
+        self.assertTrue(captured_lines)
+        emitted = "\n".join(captured_lines[0])
+        self.assertIn("Week: 100%", emitted)
+        self.assertIn("Week额度 100% >= 100%，准备禁用", emitted)
+        self.assertNotIn("5h: 100%", emitted)
 
     def test_process_token_does_not_refresh_when_refresh_disabled(self):
         settings = Settings(

@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .cpa_client import CPAClient
 from .logging_utils import ConsoleLogger, TokenLogger
-from .models import MaintainerStats
+from .models import MaintainerStats, format_window_label
 from .openai_client import OpenAIClient, parse_usage_info
 from .settings import Settings
 from .utils import format_seconds, get_expired_remaining, get_expired_remaining_with_status
@@ -181,17 +181,32 @@ class CPACodexKeeper:
     def _log_usage_summary(self, body_info, logger):
         plan = body_info.get("plan_type", "unknown")
         primary_pct = body_info.get("primary_used_percent", 0)
+        primary_seconds = body_info.get("primary_window_seconds")
         secondary_pct = body_info.get("secondary_used_percent")
+        secondary_seconds = body_info.get("secondary_window_seconds")
         credits = body_info.get("has_credits", False)
+        primary_label = format_window_label(primary_seconds, "primary_window")
+        secondary_label = format_window_label(secondary_seconds, "secondary_window") if secondary_pct is not None else None
 
-        quota_info = f"5h: {primary_pct}%"
+        quota_info = f"{primary_label}: {primary_pct}%"
         if secondary_pct is not None:
-            quota_info += f" | Week: {secondary_pct}%"
+            quota_info += f" | {secondary_label}: {secondary_pct}%"
         quota_info += f" | Credits: {credits}"
         logger.log("OK", f"存活 | Plan: {plan} | {quota_info}", indent=1)
-        return primary_pct, secondary_pct
+        return primary_pct, secondary_pct, primary_label, secondary_label
 
-    def _apply_quota_policy(self, name, disabled, primary_pct, secondary_pct, logger, *, has_refresh_token=True):
+    def _apply_quota_policy(
+        self,
+        name,
+        disabled,
+        primary_pct,
+        secondary_pct,
+        logger,
+        *,
+        has_refresh_token=True,
+        primary_label="primary_window",
+        secondary_label="secondary_window",
+    ):
         primary_reached = primary_pct >= self.settings.quota_threshold
         secondary_present = secondary_pct is not None
         secondary_reached = secondary_present and secondary_pct >= self.settings.quota_threshold
@@ -201,26 +216,26 @@ class CPACodexKeeper:
             below_threshold = primary_pct < self.settings.quota_threshold and secondary_pct < self.settings.quota_threshold
             reached_parts = []
             if primary_reached:
-                reached_parts.append(f"5h额度 {primary_pct}%")
+                reached_parts.append(f"{primary_label}额度 {primary_pct}%")
             if secondary_reached:
-                reached_parts.append(f"周额度 {secondary_pct}%")
+                reached_parts.append(f"{secondary_label}额度 {secondary_pct}%")
             reached_summary = "、".join(reached_parts)
         else:
             below_threshold = primary_pct < self.settings.quota_threshold
-            reached_summary = f"5h额度 {primary_pct}%"
+            reached_summary = f"{primary_label}额度 {primary_pct}%"
 
         if disabled:
             if below_threshold:
                 if secondary_present:
                     logger.log(
                         "WARN",
-                        f"已禁用且 5h/周额度均已低于 {self.settings.quota_threshold}%，准备启用",
+                        f"已禁用且 {primary_label}/{secondary_label} 额度均已低于 {self.settings.quota_threshold}%，准备启用",
                         indent=1,
                     )
                 else:
                     logger.log(
                         "WARN",
-                        f"已禁用但5h额度已降至 {primary_pct}% < {self.settings.quota_threshold}%，准备启用",
+                        f"已禁用但{primary_label}额度已降至 {primary_pct}% < {self.settings.quota_threshold}%，准备启用",
                         indent=1,
                     )
                 if self.set_disabled_status(name, disabled=False, logger=logger):
@@ -286,6 +301,11 @@ class CPACodexKeeper:
             success, new_data, msg = self.try_refresh(token_detail)
             if success:
                 if self.upload_updated_token(name, new_data, logger=logger):
+                    if disabled:
+                        if self.set_disabled_status(name, disabled=True, logger=logger):
+                            logger.log("DISABLE", "刷新后保持禁用", indent=1)
+                        else:
+                            logger.log("ERROR", "刷新后回写禁用失败", indent=1)
                     _, new_remaining = get_expired_remaining(new_data)
                     logger.log("REFRESH", f"{msg}，新剩余: {format_seconds(new_remaining)}", indent=1)
                     self._inc_stat("refreshed")
@@ -328,7 +348,7 @@ class CPACodexKeeper:
                 return self._handle_non_200_status(status, resp_data, logger)
 
             body_info = self.parse_usage_info(resp_data)
-            primary_pct, secondary_pct = self._log_usage_summary(body_info, logger)
+            primary_pct, secondary_pct, primary_label, secondary_label = self._log_usage_summary(body_info, logger)
             quota_result, refresh_disabled = self._apply_quota_policy(
                 name,
                 disabled,
@@ -336,6 +356,8 @@ class CPACodexKeeper:
                 secondary_pct,
                 logger,
                 has_refresh_token=self._has_refresh_token(token_detail),
+                primary_label=primary_label,
+                secondary_label=secondary_label,
             )
             if quota_result:
                 return quota_result
