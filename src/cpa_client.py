@@ -13,6 +13,7 @@ class CPAClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
+        self.last_list_auth_files_result: RequestResult | None = None
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
         self.headers = {
             "Authorization": f"Bearer {token}",
@@ -56,6 +57,7 @@ class CPAClient:
 
     def list_auth_files(self) -> list[dict[str, Any]]:
         result = self._request("GET", "/v0/management/auth-files")
+        self.last_list_auth_files_result = result
         if result.status_code != 200 or not result.json_data:
             return []
         return result.json_data.get("files", [])

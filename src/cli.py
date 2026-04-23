@@ -21,8 +21,14 @@ def main() -> int:
         parser.exit(status=2, message=f"Configuration error: {exc}\n")
 
     maintainer = CPACodexKeeper(settings=settings, dry_run=args.dry_run)
-    if args.daemon:
-        maintainer.run_forever(interval_seconds=settings.interval_seconds)
+    try:
+        if args.daemon:
+            maintainer.run_forever(interval_seconds=settings.interval_seconds)
+            return 0
+        maintainer.run()
         return 0
-    maintainer.run()
-    return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        maintainer.notifier.notify_process_exit(exc)
+        raise

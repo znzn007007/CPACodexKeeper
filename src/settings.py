@@ -11,6 +11,12 @@ DEFAULT_CPA_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_WORKER_THREADS = 8
 DEFAULT_ENABLE_REFRESH = True
+DEFAULT_NOTIFY_COOLDOWN_MINUTES = 60
+DEFAULT_NOTIFY_SEND_RECOVERY = True
+DEFAULT_NOTIFY_SEND_DAILY_SUMMARY = True
+DEFAULT_NOTIFY_FAILURE_THRESHOLD = 3
+DEFAULT_NOTIFY_LARGE_SCALE_USAGE_FAILURE_THRESHOLD = 5
+DEFAULT_NOTIFY_DAILY_SUMMARY_HOURS_UTC = (0, 3, 6, 9, 12, 15)
 PROJECT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
@@ -31,6 +37,17 @@ class Settings:
     max_retries: int = DEFAULT_MAX_RETRIES
     worker_threads: int = DEFAULT_WORKER_THREADS
     enable_refresh: bool = DEFAULT_ENABLE_REFRESH
+    feishu_webhook_url: str | None = None
+    feishu_security_mode: str = "none"
+    feishu_keyword: str | None = None
+    feishu_secret: str | None = None
+    notify_cooldown_minutes: int = DEFAULT_NOTIFY_COOLDOWN_MINUTES
+    notify_send_recovery: bool = DEFAULT_NOTIFY_SEND_RECOVERY
+    notify_send_daily_summary: bool = DEFAULT_NOTIFY_SEND_DAILY_SUMMARY
+    notify_daily_summary_hours_utc: tuple[int, ...] = DEFAULT_NOTIFY_DAILY_SUMMARY_HOURS_UTC
+    notify_failure_threshold: int = DEFAULT_NOTIFY_FAILURE_THRESHOLD
+    notify_large_scale_usage_failure_threshold: int = DEFAULT_NOTIFY_LARGE_SCALE_USAGE_FAILURE_THRESHOLD
+    notify_state_file: str = "./runtime/notify_state.json"
 
 
 def _read_project_env_file(env_file: Path | None = None) -> dict[str, str]:
@@ -88,6 +105,36 @@ def _read_bool(name: str, default: bool, env_values: dict[str, str]) -> bool:
     raise SettingsError(f"{name} must be a boolean")
 
 
+def _read_csv_ints(
+    name: str,
+    default: tuple[int, ...],
+    env_values: dict[str, str],
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> tuple[int, ...]:
+    raw = _get_config_value(name, env_values)
+    if raw in (None, ""):
+        return default
+    values: list[int] = []
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError as exc:
+            raise SettingsError(f"{name} must contain integers separated by commas") from exc
+        if value < minimum:
+            raise SettingsError(f"{name} values must be >= {minimum}")
+        if maximum is not None and value > maximum:
+            raise SettingsError(f"{name} values must be <= {maximum}")
+        values.append(value)
+    if not values:
+        raise SettingsError(f"{name} must contain at least one integer")
+    return tuple(sorted(set(values)))
+
+
 def load_settings(env_file: Path | None = None) -> Settings:
     env_values = _read_project_env_file(env_file)
     endpoint = (_get_config_value("CPA_ENDPOINT", env_values) or "").strip().rstrip("/")
@@ -101,6 +148,19 @@ def load_settings(env_file: Path | None = None) -> Settings:
     if not endpoint.startswith(("http://", "https://")):
         raise SettingsError("CPA_ENDPOINT must start with http:// or https://")
 
+    feishu_webhook_url = (_get_config_value("FEISHU_WEBHOOK_URL", env_values) or "").strip() or None
+    feishu_security_mode = (_get_config_value("FEISHU_SECURITY_MODE", env_values) or "none").strip().lower()
+    feishu_keyword = (_get_config_value("FEISHU_KEYWORD", env_values) or "").strip() or None
+    feishu_secret = (_get_config_value("FEISHU_SECRET", env_values) or "").strip() or None
+    notify_state_file = (_get_config_value("FEISHU_NOTIFY_STATE_FILE", env_values) or "./runtime/notify_state.json").strip()
+
+    if feishu_security_mode not in {"none", "keyword", "secret"}:
+        raise SettingsError("FEISHU_SECURITY_MODE must be one of: none, keyword, secret")
+    if feishu_webhook_url and feishu_security_mode == "keyword" and not feishu_keyword:
+        raise SettingsError("FEISHU_KEYWORD is required when FEISHU_SECURITY_MODE=keyword")
+    if feishu_webhook_url and feishu_security_mode == "secret" and not feishu_secret:
+        raise SettingsError("FEISHU_SECRET is required when FEISHU_SECURITY_MODE=secret")
+
     return Settings(
         cpa_endpoint=endpoint,
         cpa_token=token,
@@ -113,4 +173,31 @@ def load_settings(env_file: Path | None = None) -> Settings:
         max_retries=_read_int("CPA_MAX_RETRIES", DEFAULT_MAX_RETRIES, env_values, minimum=0, maximum=5),
         worker_threads=_read_int("CPA_WORKER_THREADS", DEFAULT_WORKER_THREADS, env_values, minimum=1),
         enable_refresh=_read_bool("CPA_ENABLE_REFRESH", DEFAULT_ENABLE_REFRESH, env_values),
+        feishu_webhook_url=feishu_webhook_url,
+        feishu_security_mode=feishu_security_mode,
+        feishu_keyword=feishu_keyword,
+        feishu_secret=feishu_secret,
+        notify_cooldown_minutes=_read_int("FEISHU_NOTIFY_COOLDOWN_MINUTES", DEFAULT_NOTIFY_COOLDOWN_MINUTES, env_values, minimum=1),
+        notify_send_recovery=_read_bool("FEISHU_NOTIFY_SEND_RECOVERY", DEFAULT_NOTIFY_SEND_RECOVERY, env_values),
+        notify_send_daily_summary=_read_bool("FEISHU_NOTIFY_SEND_DAILY_SUMMARY", DEFAULT_NOTIFY_SEND_DAILY_SUMMARY, env_values),
+        notify_daily_summary_hours_utc=_read_csv_ints(
+            "FEISHU_NOTIFY_DAILY_SUMMARY_HOURS_UTC",
+            DEFAULT_NOTIFY_DAILY_SUMMARY_HOURS_UTC,
+            env_values,
+            minimum=0,
+            maximum=23,
+        ),
+        notify_failure_threshold=_read_int(
+            "FEISHU_NOTIFY_FAILURE_THRESHOLD",
+            DEFAULT_NOTIFY_FAILURE_THRESHOLD,
+            env_values,
+            minimum=1,
+        ),
+        notify_large_scale_usage_failure_threshold=_read_int(
+            "FEISHU_NOTIFY_LARGE_SCALE_USAGE_FAILURE_THRESHOLD",
+            DEFAULT_NOTIFY_LARGE_SCALE_USAGE_FAILURE_THRESHOLD,
+            env_values,
+            minimum=1,
+        ),
+        notify_state_file=notify_state_file,
     )

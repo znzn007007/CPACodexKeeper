@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .cpa_client import CPAClient
 from .logging_utils import ConsoleLogger, TokenLogger
 from .models import MaintainerStats, format_window_label
+from .notifier import FeishuNotifier
 from .openai_client import OpenAIClient, parse_usage_info
 from .settings import Settings
 from .utils import format_seconds, get_expired_remaining, get_expired_remaining_with_status
@@ -16,6 +17,7 @@ class CPACodexKeeper:
         self.settings = settings
         self.dry_run = dry_run
         self.logger = ConsoleLogger()
+        self.notifier = FeishuNotifier(settings=settings, dry_run=dry_run)
         self.cpa_client = CPAClient(
             settings.cpa_endpoint,
             settings.cpa_token,
@@ -30,10 +32,24 @@ class CPACodexKeeper:
         )
         self.stats = MaintainerStats()
         self._stats_lock = threading.Lock()
+        self._events_lock = threading.Lock()
+        self.round_events = self._empty_round_events()
+
+    def _empty_round_events(self):
+        return {
+            "deleted": [],
+            "disabled": [],
+            "enabled": [],
+            "refreshed": [],
+            "network_errors": [],
+            "task_exceptions": [],
+        }
 
     def reset_stats(self):
         with self._stats_lock:
             self.stats = MaintainerStats()
+        with self._events_lock:
+            self.round_events = self._empty_round_events()
 
     def blank_line(self):
         self.logger.blank_line()
@@ -49,6 +65,17 @@ class CPACodexKeeper:
     def _stats_snapshot(self):
         with self._stats_lock:
             return self.stats.as_dict()
+
+    def _record_event(self, event_name, payload):
+        with self._events_lock:
+            self.round_events[event_name].append(payload)
+
+    def _events_snapshot(self):
+        with self._events_lock:
+            return {
+                key: list(value)
+                for key, value in self.round_events.items()
+            }
 
     def log(self, level, message, indent=0):
         self.logger.log(level, message, indent=indent)
@@ -129,10 +156,12 @@ class CPACodexKeeper:
             return True
         return self.cpa_client.upload_auth_file(name, token_data)
 
-    def _skip_token(self, message, logger, *, network_error=False):
+    def _skip_token(self, message, logger, *, network_error=False, token_name=None):
         logger.log("WARN" if network_error else "SKIP", message, indent=1)
         if network_error:
             self._inc_stat("network_error")
+            if token_name:
+                self._record_event("network_errors", {"name": token_name, "message": message})
             logger.blank_line()
             return "network_error"
         self._inc_stat("skipped")
@@ -154,22 +183,43 @@ class CPACodexKeeper:
     def _has_refresh_token(self, token_detail):
         return bool((token_detail.get("refresh_token") or "").strip())
 
-    def _delete_token_with_reason(self, name, reason, logger):
+    def _delete_token_with_reason(self, name, reason, logger, *, token_detail=None, status_code=None, detail=None):
         logger.log("WARN", reason, indent=1)
         if self.delete_token(name, logger=logger):
             logger.log("DELETE", "已删除", indent=1)
             self._inc_stat("dead")
+            email = (token_detail or {}).get("email")
+            event = {"name": name, "reason": reason, "email": email}
+            if status_code is not None:
+                event["status_code"] = status_code
+            if detail:
+                event["detail"] = detail
+            self._record_event("deleted", event)
+            self.notifier.notify_delete(
+                name,
+                reason,
+                email=email,
+                status_code=status_code,
+                detail=detail,
+            )
             logger.blank_line()
             return "dead"
         return self._skip_token("删除失败", logger)
 
-    def _handle_invalid_token(self, name, logger):
-        return self._delete_token_with_reason(name, "Token 无效或 workspace 已停用，准备删除", logger)
+    def _handle_invalid_token(self, name, logger, *, token_detail=None, status_code=None, detail=None):
+        return self._delete_token_with_reason(
+            name,
+            "Token 无效或 workspace 已停用，准备删除",
+            logger,
+            token_detail=token_detail,
+            status_code=status_code,
+            detail=detail,
+        )
 
     def _apply_non_refreshable_expiry_policy(self, name, token_detail, remaining_seconds, expiry_known, logger):
         if self._has_refresh_token(token_detail) or not expiry_known or remaining_seconds > 0:
             return None
-        return self._delete_token_with_reason(name, "Token 已过期且无 Refresh Token，准备删除", logger)
+        return self._delete_token_with_reason(name, "Token 已过期且无 Refresh Token，准备删除", logger, token_detail=token_detail)
 
     def _handle_non_200_status(self, status, resp_data, logger):
         detail = resp_data.get("brief", "") if isinstance(resp_data, dict) else str(resp_data)
@@ -203,6 +253,7 @@ class CPACodexKeeper:
         secondary_pct,
         logger,
         *,
+        email=None,
         has_refresh_token=True,
         primary_label="primary_window",
         secondary_label="secondary_window",
@@ -241,6 +292,7 @@ class CPACodexKeeper:
                 if self.set_disabled_status(name, disabled=False, logger=logger):
                     logger.log("ENABLE", "已重新启用", indent=1)
                     self._inc_stat("enabled")
+                    self._record_event("enabled", {"name": name, "email": email})
                     effective_disabled = False
                 else:
                     logger.log("ERROR", "启用失败", indent=1)
@@ -250,6 +302,7 @@ class CPACodexKeeper:
                     name,
                     f"无 Refresh Token，且{reached_summary} >= {self.settings.quota_threshold}%，准备删除",
                     logger,
+                    token_detail={"email": email},
                 ), effective_disabled
             logger.log(
                 "INFO",
@@ -273,6 +326,7 @@ class CPACodexKeeper:
             if self.set_disabled_status(name, disabled=True, logger=logger):
                 logger.log("DISABLE", "已禁用", indent=1)
                 self._inc_stat("disabled")
+                self._record_event("disabled", {"name": name, "email": email})
                 effective_disabled = True
             else:
                 logger.log("ERROR", "禁用失败", indent=1)
@@ -309,6 +363,8 @@ class CPACodexKeeper:
                     _, new_remaining = get_expired_remaining(new_data)
                     logger.log("REFRESH", f"{msg}，新剩余: {format_seconds(new_remaining)}", indent=1)
                     self._inc_stat("refreshed")
+                    self._record_event("refreshed", {"name": name, "email": token_detail.get("email"), "message": msg})
+                    self.notifier.notify_refresh(name, msg, email=token_detail.get("email"))
                 else:
                     logger.log("ERROR", "刷新成功但上传失败", indent=1)
             else:
@@ -337,13 +393,20 @@ class CPACodexKeeper:
             logger.log("INFO", "检测在线状态...", indent=1)
             status, resp_data = self.check_token_live(access_token, account_id)
             if status in (401, 402):
-                return self._handle_invalid_token(name, logger)
+                detail = resp_data.get("brief", "") if isinstance(resp_data, dict) else str(resp_data)
+                return self._handle_invalid_token(
+                    name,
+                    logger,
+                    token_detail=token_detail,
+                    status_code=status,
+                    detail=detail,
+                )
             if status is None:
                 detail = resp_data.get("brief", "") if isinstance(resp_data, dict) else str(resp_data)
                 msg = "网络检测失败"
                 if detail:
                     msg += f" | {detail}"
-                return self._skip_token(msg, logger, network_error=True)
+                return self._skip_token(msg, logger, network_error=True, token_name=name)
             if status != 200:
                 return self._handle_non_200_status(status, resp_data, logger)
 
@@ -355,6 +418,7 @@ class CPACodexKeeper:
                 primary_pct,
                 secondary_pct,
                 logger,
+                email=token_detail.get("email"),
                 has_refresh_token=self._has_refresh_token(token_detail),
                 primary_label=primary_label,
                 secondary_label=secondary_label,
@@ -383,15 +447,31 @@ class CPACodexKeeper:
         self.log("INFO", f"Quota threshold: {self.settings.quota_threshold}% (disable when reached)")
         self.log("INFO", f"Expiry threshold: {self.settings.expiry_threshold_days} days (refresh disabled auth when below)")
         self.log("INFO", f"Refresh enabled: {self.settings.enable_refresh}")
+        self.log("INFO", f"Feishu notify enabled: {self.notifier.enabled}")
         if self.dry_run:
             self.log("DRY", "演练模式 (不实际修改)")
         self.logger.divider()
+
+    def _notify_post_run(self, stats):
+        events = self._events_snapshot()
+        if stats["network_error"] >= self.settings.notify_large_scale_usage_failure_threshold:
+            self.notifier.notify_large_scale_usage_failure(stats, events)
+        self.notifier.handle_failure_state(stats)
+        self.notifier.notify_round_changes(stats, events)
+        self.notifier.maybe_send_daily_summary(stats)
 
     def run(self):
         self.reset_stats()
         self.log_startup()
         tokens = self.get_token_list()
         if not tokens:
+            result = self.cpa_client.last_list_auth_files_result
+            if result and result.status_code not in (200, None):
+                self.notifier.notify_cpa_api_exception(
+                    f"/v0/management/auth-files 返回状态码 {result.status_code} | {result.brief or result.body[:200]}"
+                )
+            elif result and result.status_code is None:
+                self.notifier.notify_cpa_api_exception(result.error or "获取 token 列表失败")
             self.log("WARN", "未获取到任何 codex Token")
             return
 
@@ -415,6 +495,7 @@ class CPACodexKeeper:
                 except Exception as exc:
                     token_name = future_map[future].get("name", "unknown")
                     self.log("ERROR", f"Token 任务异常 ({token_name}): {exc}", indent=1)
+                    self._record_event("task_exceptions", {"name": token_name, "message": str(exc)})
                     self.blank_line()
 
         elapsed = time.time() - start_time
@@ -432,6 +513,7 @@ class CPACodexKeeper:
         self.log("INFO", f"- 跳过: {stats['skipped']}", indent=1)
         self.log("INFO", f"- 网络失败: {stats['network_error']}", indent=1)
         self.logger.divider()
+        self._notify_post_run(stats)
 
     def run_forever(self, interval_seconds=1800):
         round_no = 0
@@ -446,5 +528,6 @@ class CPACodexKeeper:
                 raise
             except Exception as exc:
                 self.log("ERROR", f"第 {round_no} 轮巡检异常: {exc}")
+                self.notifier.notify_round_exception(round_no, exc)
             self.log("INFO", f"等待 {interval_seconds} 秒后开始下一轮")
             time.sleep(interval_seconds)
