@@ -25,6 +25,7 @@ class UsageInfo:
     secondary_window: TokenQuota | None = None
     has_credits: bool = False
     credits_balance: float | None = None
+    valid: bool = True
 
     @property
     def primary_used_percent(self) -> int:

@@ -8,6 +8,8 @@ from .logging_utils import ConsoleLogger, TokenLogger
 from .models import MaintainerStats, format_window_label
 from .notifier import FeishuNotifier
 from .openai_client import OpenAIClient, parse_usage_info
+from .quota_job import QuotaHealthcheckJob
+from .quota_report import error_snapshot, snapshot_from_usage
 from .settings import Settings
 from .utils import format_seconds, get_expired_remaining, get_expired_remaining_with_status
 
@@ -34,6 +36,9 @@ class CPACodexKeeper:
         self._stats_lock = threading.Lock()
         self._events_lock = threading.Lock()
         self.round_events = self._empty_round_events()
+        self._quota_lock = threading.Lock()
+        self.quota_snapshots = []
+        self.quota_job = QuotaHealthcheckJob(settings=settings, sender=self.notifier, logger=self.log)
 
     def _empty_round_events(self):
         return {
@@ -50,6 +55,8 @@ class CPACodexKeeper:
             self.stats = MaintainerStats()
         with self._events_lock:
             self.round_events = self._empty_round_events()
+        with self._quota_lock:
+            self.quota_snapshots = []
 
     def blank_line(self):
         self.logger.blank_line()
@@ -76,6 +83,14 @@ class CPACodexKeeper:
                 key: list(value)
                 for key, value in self.round_events.items()
             }
+
+    def _record_quota_snapshot(self, snapshot):
+        with self._quota_lock:
+            self.quota_snapshots.append(snapshot)
+
+    def _quota_snapshot_list(self):
+        with self._quota_lock:
+            return list(self.quota_snapshots)
 
     def log(self, level, message, indent=0):
         self.logger.log(level, message, indent=indent)
@@ -195,13 +210,6 @@ class CPACodexKeeper:
             if detail:
                 event["detail"] = detail
             self._record_event("deleted", event)
-            self.notifier.notify_delete(
-                name,
-                reason,
-                email=email,
-                status_code=status_code,
-                detail=detail,
-            )
             logger.blank_line()
             return "dead"
         return self._skip_token("删除失败", logger)
@@ -326,7 +334,7 @@ class CPACodexKeeper:
             if self.set_disabled_status(name, disabled=True, logger=logger):
                 logger.log("DISABLE", "已禁用", indent=1)
                 self._inc_stat("disabled")
-                self._record_event("disabled", {"name": name, "email": email})
+                self._record_event("disabled", {"name": name, "email": email, "reason": reached_summary})
                 effective_disabled = True
             else:
                 logger.log("ERROR", "禁用失败", indent=1)
@@ -364,7 +372,6 @@ class CPACodexKeeper:
                     logger.log("REFRESH", f"{msg}，新剩余: {format_seconds(new_remaining)}", indent=1)
                     self._inc_stat("refreshed")
                     self._record_event("refreshed", {"name": name, "email": token_detail.get("email"), "message": msg})
-                    self.notifier.notify_refresh(name, msg, email=token_detail.get("email"))
                 else:
                     logger.log("ERROR", "刷新成功但上传失败", indent=1)
             else:
@@ -406,11 +413,14 @@ class CPACodexKeeper:
                 msg = "网络检测失败"
                 if detail:
                     msg += f" | {detail}"
+                self._record_quota_snapshot(error_snapshot(name=name, email=token_detail.get("email"), error=msg))
                 return self._skip_token(msg, logger, network_error=True, token_name=name)
             if status != 200:
                 return self._handle_non_200_status(status, resp_data, logger)
 
+            usage_model = parse_usage_info(resp_data)
             body_info = self.parse_usage_info(resp_data)
+            self._record_quota_snapshot(snapshot_from_usage(name=name, email=token_detail.get("email"), usage=usage_model))
             primary_pct, secondary_pct, primary_label, secondary_label = self._log_usage_summary(body_info, logger)
             quota_result, refresh_disabled = self._apply_quota_policy(
                 name,
@@ -457,8 +467,29 @@ class CPACodexKeeper:
         if stats["network_error"] >= self.settings.notify_large_scale_usage_failure_threshold:
             self.notifier.notify_large_scale_usage_failure(stats, events)
         self.notifier.handle_failure_state(stats)
-        self.notifier.notify_round_changes(stats, events)
-        self.notifier.maybe_send_daily_summary(stats)
+        quota_agg = self._run_quota_job()
+        self.notifier.notify_deleted_accounts(events.get("deleted", []))
+        self.notifier.notify_disabled_accounts(events.get("disabled", []))
+        self._maybe_send_status_broadcast(stats, events, quota_agg)
+
+    def _run_quota_job(self):
+        try:
+            return self.quota_job.run(self._quota_snapshot_list())
+        except Exception as exc:
+            self.log("ERROR", f"CPA quota report failed: {exc}")
+            return None
+
+    def _maybe_send_status_broadcast(self, stats, events, quota_agg):
+        if not self.quota_job.state.should_send_broadcast(
+            enabled=self.settings.status_broadcast_enabled,
+            hours_local=self.settings.status_broadcast_hours_local,
+            timezone_name=self.settings.status_broadcast_timezone,
+        ):
+            return
+        sent = self.notifier.notify_status_broadcast(stats, events, quota_agg)
+        if sent and not self.dry_run:
+            self.quota_job.state.commit_broadcast(timezone_name=self.settings.status_broadcast_timezone)
+            self.quota_job.state.save()
 
     def run(self):
         self.reset_stats()
@@ -496,6 +527,7 @@ class CPACodexKeeper:
                     token_name = future_map[future].get("name", "unknown")
                     self.log("ERROR", f"Token 任务异常 ({token_name}): {exc}", indent=1)
                     self._record_event("task_exceptions", {"name": token_name, "message": str(exc)})
+                    self._record_quota_snapshot(error_snapshot(name=token_name, error=str(exc)))
                     self.blank_line()
 
         elapsed = time.time() - start_time

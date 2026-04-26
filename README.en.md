@@ -327,6 +327,10 @@ CPACodexKeeper/
 │  ├─ maintainer.py
 │  ├─ models.py
 │  ├─ openai_client.py
+│  ├─ notifier.py
+│  ├─ quota_job.py
+│  ├─ quota_report.py
+│  ├─ quota_state.py
 │  ├─ settings.py
 │  └─ utils.py
 ├─ tests/
@@ -341,7 +345,61 @@ CPACodexKeeper/
 
 ---
 
-## 12. Troubleshooting
+## 12. Scheduled broadcast and quota alerts
+
+Feishu notifications now follow an alert-first model:
+
+- **Real-time notifications**: deleted tokens, disabled tokens, Plus quota alert/recovery, CPA API exceptions, large-scale usage failures, consecutive network failure/recovery, round exceptions, and process exits.
+- **Not real-time anymore**: normal round changes, re-enabled tokens, and refreshed tokens. They are included in the scheduled broadcast instead.
+- **Scheduled broadcast**: account maintenance stats and quota health are combined into one `CPA Codex 定时播报` message.
+
+Every Feishu title is prefixed with the configured server name, for example `[sub2api-prod] CPA Codex 定时播报`. Set a unique `CPA_SERVER_NAME` on every machine.
+
+### 12.1 Configuration
+
+```env
+CPA_SERVER_NAME=sub2api-prod
+CPA_STATUS_BROADCAST_ENABLED=true
+CPA_STATUS_BROADCAST_HOURS_LOCAL=8,12,18,23
+CPA_STATUS_BROADCAST_TIMEZONE=Asia/Hong_Kong
+
+CPA_QUOTA_REPORT_ENABLED=true
+CPA_QUOTA_ALERT_ENABLED=true
+CPA_QUOTA_PLUS_EFFECTIVE_USABLE_LT=10
+CPA_QUOTA_PLUS_AVG_REMAINING_5H_PERCENT_LT=30
+CPA_QUOTA_PLUS_AVG_REMAINING_7D_PERCENT_LT=30
+CPA_QUOTA_STATE_FILE=./runtime/quota_healthcheck_state.json
+```
+
+`CPA_STATUS_BROADCAST_HOURS_LOCAL` uses local hours and defaults to East-8. Legacy `FEISHU_NOTIFY_SEND_DAILY_SUMMARY` and `FEISHU_NOTIFY_DAILY_SUMMARY_HOURS_UTC` are still accepted for compatibility, but new deployments should use `CPA_STATUS_BROADCAST_*`.
+
+### 12.2 Controlled notification tests
+
+These commands test message formatting and Feishu transport without entering the maintainer flow or mutating CPA auth files:
+
+```bash
+python main.py --quota-test broadcast --quota-test-state-file ./runtime/quota_healthcheck_state.test.json
+python main.py --quota-test deleted --quota-test-state-file ./runtime/quota_healthcheck_state.test.json
+python main.py --quota-test disabled --quota-test-state-file ./runtime/quota_healthcheck_state.test.json
+python main.py --quota-test alert --quota-test-state-file ./runtime/quota_healthcheck_state.test.json
+python main.py --quota-test recovery --quota-test-state-file ./runtime/quota_healthcheck_state.test.json
+```
+
+Use `--dry-run` when you only want local validation without sending Feishu messages.
+
+### 12.3 Runtime state
+
+Quota alert state and scheduled broadcast slots are stored in:
+
+```text
+./runtime/quota_healthcheck_state.json
+```
+
+They do not reuse `./runtime/notify_state.json`, so notification cooldown state stays separate from quota and broadcast domain state. Keep `runtime/` persisted in Docker deployments.
+
+---
+
+## 13. Troubleshooting
 
 ### Configuration error at startup
 
@@ -371,7 +429,7 @@ Make sure Docker CLI is installed and available in your environment.
 
 ---
 
-## 13. Intended usage
+## 14. Intended usage
 
 This project is meant for **authorized internal maintenance scenarios**, such as:
 

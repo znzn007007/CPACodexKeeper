@@ -79,12 +79,15 @@ def parse_usage_info(result: RequestResult | dict | None) -> UsageInfo:
         body = None
 
     if not isinstance(body, dict):
-        return UsageInfo()
+        return UsageInfo(valid=False)
 
-    rate_limit = body.get("rate_limit") or {}
-    primary = rate_limit.get("primary_window") or {}
+    raw_rate_limit = body.get("rate_limit") or {}
+    rate_limit = raw_rate_limit if isinstance(raw_rate_limit, dict) else {}
+    raw_primary = rate_limit.get("primary_window") or {}
+    primary = raw_primary if isinstance(raw_primary, dict) else {}
     secondary = rate_limit.get("secondary_window")
     credits = body.get("credits") or {}
+    valid = isinstance(primary, dict) and bool(primary)
 
     primary_window = TokenQuota(
         used_percent=int(primary.get("used_percent", 0) or 0),
@@ -107,4 +110,5 @@ def parse_usage_info(result: RequestResult | dict | None) -> UsageInfo:
         secondary_window=secondary_window,
         has_credits=bool(credits.get("has_credits", False)),
         credits_balance=credits.get("balance"),
+        valid=valid,
     )
