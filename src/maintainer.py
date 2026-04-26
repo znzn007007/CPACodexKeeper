@@ -92,6 +92,19 @@ class CPACodexKeeper:
         with self._quota_lock:
             return list(self.quota_snapshots)
 
+    def _merge_list_metadata(self, token_detail, token_info):
+        """Keep metadata that download responses do not include.
+
+        CPA's download endpoint returns the auth file content, while list_auth_files
+        carries management metadata such as disabled status. Quota policy must use
+        the list metadata so an already-disabled token is not disabled again every
+        scan.
+        """
+        if "disabled" in token_info:
+            token_detail["disabled"] = bool(token_info.get("disabled"))
+        if not token_detail.get("email") and token_info.get("email"):
+            token_detail["email"] = token_info.get("email")
+
     def log(self, level, message, indent=0):
         self.logger.log(level, message, indent=indent)
 
@@ -387,6 +400,7 @@ class CPACodexKeeper:
             token_detail = self.get_token_detail(name)
             if not token_detail:
                 return self._skip_token("获取详情失败", logger)
+            self._merge_list_metadata(token_detail, token_info)
 
             disabled, remaining_seconds, remaining_str, expiry_known = self._log_token_details(token_detail, logger)
             cleanup_result = self._apply_non_refreshable_expiry_policy(name, token_detail, remaining_seconds, expiry_known, logger)

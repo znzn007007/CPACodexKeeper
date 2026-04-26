@@ -214,6 +214,33 @@ class MaintainerTests(unittest.TestCase):
         self.maintainer.set_disabled_status.assert_not_called()
         self.assertEqual(self.maintainer.stats.enabled, 0)
 
+    def test_process_token_uses_list_disabled_metadata_when_download_omits_it(self):
+        self.maintainer.get_token_detail = Mock(return_value={
+            "email": "a@example.com",
+            "access_token": "token",
+            "refresh_token": "rt",
+            "account_id": "acc",
+            "expired": "2099-01-01T00:00:00Z",
+        })
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 100, "limit_window_seconds": 18000},
+                    "secondary_window": {"used_percent": 95, "limit_window_seconds": 604800},
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
+        self.maintainer.set_disabled_status = Mock(return_value=True)
+
+        result = self.maintainer.process_token({"name": "t3-still-disabled", "disabled": True}, 1, 1)
+
+        self.assertEqual(result, "alive")
+        self.maintainer.set_disabled_status.assert_not_called()
+        self.assertEqual(self.maintainer.stats.disabled, 0)
+        self.assertEqual(self.maintainer.round_events["disabled"], [])
+
     def test_process_token_refreshes_disabled_token_when_near_expiry(self):
         self.maintainer.settings.enable_refresh = True
         near_expiry = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -757,3 +784,4 @@ class MaintainerTests(unittest.TestCase):
         self.maintainer.notifier.notify_status_broadcast.assert_called_once()
         self.maintainer.quota_job.state.commit_broadcast.assert_not_called()
         self.maintainer.quota_job.state.save.assert_not_called()
+

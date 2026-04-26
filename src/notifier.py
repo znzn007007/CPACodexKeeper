@@ -149,6 +149,14 @@ class FeishuNotifier:
             lines.append(f"... 另有 {len(events) - limit} 个，详见容器日志")
         return lines
 
+    def _email_event_lines(self, events: list[dict[str, Any]], *, limit: int = 20) -> list[str]:
+        lines: list[str] = []
+        for item in events[:limit]:
+            lines.append("- " + str(item.get("email") or item.get("name") or "unknown"))
+        if len(events) > limit:
+            lines.append(f"... 另有 {len(events) - limit} 个，详见容器日志")
+        return lines
+
     def notify_deleted_accounts(self, events: list[dict[str, Any]], *, test: bool = False) -> bool:
         if not events:
             return False
@@ -161,7 +169,7 @@ class FeishuNotifier:
         if not events:
             return False
         lines = [f"本轮禁用: {len(events)} 个", "禁用名单:"]
-        lines.extend(self._event_lines(events, include_reason=False))
+        lines.extend(self._email_event_lines(events))
         title = "[TEST] CPA Codex 禁用通知" if test else "CPA Codex 禁用通知"
         return self.send(title, lines)
 
@@ -177,7 +185,8 @@ class FeishuNotifier:
             values = events.get(key, [])
             if not values:
                 return "-"
-            names = [str(item.get("name") or "unknown") for item in values]
+            label_key = "email" if key == "disabled" else "name"
+            names = [str(item.get(label_key) or item.get("name") or "unknown") for item in values]
             display = ", ".join(names[:20])
             if len(names) > 20:
                 display += f" ... 另有 {len(names) - 20} 个"
