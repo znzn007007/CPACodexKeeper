@@ -125,13 +125,20 @@ class FeishuNotifier:
                 self._save_state()
         return True
 
-    def _event_lines(self, events: list[dict[str, Any]], *, include_status: bool = False, limit: int = 20) -> list[str]:
+    def _event_lines(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        include_reason: bool = True,
+        include_status: bool = False,
+        limit: int = 20,
+    ) -> list[str]:
         lines: list[str] = []
         for item in events[:limit]:
             parts = [str(item.get("name") or "unknown")]
             if item.get("email"):
                 parts.append(str(item["email"]))
-            if item.get("reason"):
+            if include_reason and item.get("reason"):
                 parts.append(str(item["reason"])[:160])
             if include_status and item.get("status_code") is not None:
                 parts.append(f"状态码 {item['status_code']}")
@@ -154,7 +161,7 @@ class FeishuNotifier:
         if not events:
             return False
         lines = [f"本轮禁用: {len(events)} 个", "禁用名单:"]
-        lines.extend(self._event_lines(events))
+        lines.extend(self._event_lines(events, include_reason=False))
         title = "[TEST] CPA Codex 禁用通知" if test else "CPA Codex 禁用通知"
         return self.send(title, lines)
 
