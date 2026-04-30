@@ -22,6 +22,13 @@ class CLITests(unittest.TestCase):
 
         self.assertFalse(args.daemon)
 
+    def test_quota_test_supports_broadcast_deleted_disabled(self):
+        parser = build_arg_parser()
+        for mode in ("broadcast", "deleted", "disabled", "alert", "recovery"):
+            with self.subTest(mode=mode):
+                args = parser.parse_args(["--quota-test", mode])
+                self.assertEqual(args.quota_test, mode)
+
     @patch("src.cli.load_settings")
     @patch("src.cli.CPACodexKeeper")
     @patch("sys.argv", ["prog", "--once"])

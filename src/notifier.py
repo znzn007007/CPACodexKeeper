@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request
 
+from .quota_report import build_daily_summary_lines
 from .settings import Settings
 
 
@@ -32,6 +33,7 @@ class FeishuNotifier:
         if not self.state_file.exists():
             return {
                 "cooldowns": {},
+                "notified_disabled_accounts": [],
                 "last_daily_summary_date": None,
                 "last_daily_summary_slot": None,
                 "consecutive_failure_rounds": 0,
@@ -43,6 +45,7 @@ class FeishuNotifier:
         except Exception:
             return {
                 "cooldowns": {},
+                "notified_disabled_accounts": [],
                 "last_daily_summary_date": None,
                 "last_daily_summary_slot": None,
                 "consecutive_failure_rounds": 0,
@@ -55,10 +58,19 @@ class FeishuNotifier:
         self.state_file.write_text(json.dumps(self._state, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _format_text(self, title: str, lines: list[str]) -> str:
-        text = title + "\n" + "\n".join(lines)
+        text = self._format_title(title) + "\n" + "\n".join(lines)
         if self.settings.feishu_security_mode == "keyword" and self.settings.feishu_keyword:
             text = f"{self.settings.feishu_keyword} {text}"
         return text
+
+    def _format_title(self, title: str) -> str:
+        server_name = (self.settings.server_name or "cpacodexkeeper").strip()
+        if self.dry_run and not title.startswith("[DRY-RUN]"):
+            title = f"[DRY-RUN] {title}"
+        prefix = f"[{server_name}] "
+        if title.startswith(prefix):
+            return title
+        return f"{prefix}{title}"
 
     def _build_payload(self, title: str, lines: list[str]) -> dict[str, Any]:
         text = self._format_text(title, lines)
@@ -96,9 +108,6 @@ class FeishuNotifier:
                 return False
             payload = self._build_payload(title, lines)
             if self.dry_run:
-                if dedupe_key:
-                    self._mark_cooldown(dedupe_key)
-                    self._save_state()
                 return True
         try:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -115,46 +124,140 @@ class FeishuNotifier:
         with self._lock:
             if dedupe_key:
                 self._mark_cooldown(dedupe_key)
-            self._save_state()
+                self._save_state()
         return True
 
-    def notify_delete(self, name: str, reason: str, *, email: str | None = None, status_code: int | None = None, detail: str | None = None) -> None:
-        lines = [f"Token: {name}", f"原因: {reason}"]
-        if email:
-            lines.append(f"Email: {email}")
-        if status_code is not None:
-            lines.append(f"状态码: {status_code}")
-        if detail:
-            lines.append(f"详情: {detail[:300]}")
-        self.send("CPACodexKeeper 删除通知", lines)
+    def _event_lines(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        include_reason: bool = True,
+        include_status: bool = False,
+        limit: int = 20,
+    ) -> list[str]:
+        lines: list[str] = []
+        for item in events[:limit]:
+            parts = [str(item.get("name") or "unknown")]
+            if item.get("email"):
+                parts.append(str(item["email"]))
+            if include_reason and item.get("reason"):
+                parts.append(str(item["reason"])[:160])
+            if include_status and item.get("status_code") is not None:
+                parts.append(f"状态码 {item['status_code']}")
+            if item.get("detail"):
+                parts.append(str(item["detail"])[:120])
+            lines.append("- " + " | ".join(parts))
+        if len(events) > limit:
+            lines.append(f"... 另有 {len(events) - limit} 个，详见容器日志")
+        return lines
 
-    def notify_refresh(self, name: str, message: str, *, email: str | None = None) -> None:
-        lines = [f"Token: {name}", f"结果: {message}"]
-        if email:
-            lines.append(f"Email: {email}")
-        self.send("CPACodexKeeper 刷新通知", lines)
+    def _email_event_lines(self, events: list[dict[str, Any]], *, limit: int = 20) -> list[str]:
+        lines: list[str] = []
+        for item in events[:limit]:
+            lines.append("- " + str(item.get("email") or item.get("name") or "unknown"))
+        if len(events) > limit:
+            lines.append(f"... 另有 {len(events) - limit} 个，详见容器日志")
+        return lines
 
-    def notify_round_changes(self, stats: dict[str, int], events: dict[str, list[dict[str, Any]]]) -> None:
-        changed = any(events.get(key) for key in ("deleted", "disabled", "enabled", "refreshed"))
-        if not changed:
+    def _disabled_event_key(self, event: dict[str, Any]) -> str | None:
+        value = event.get("email") or event.get("name")
+        if value is None:
+            return None
+        key = str(value).strip()
+        return key or None
+
+    def suppress_repeated_disabled_events(self, events: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+        filtered = {key: list(value) for key, value in events.items()}
+        with self._lock:
+            notified = set(self._state.setdefault("notified_disabled_accounts", []))
+            enabled_keys = {
+                key
+                for item in filtered.get("enabled", [])
+                if (key := self._disabled_event_key(item))
+            }
+            if enabled_keys:
+                notified -= enabled_keys
+                self._state["notified_disabled_accounts"] = sorted(notified)
+                self._save_state()
+            filtered["disabled"] = [
+                item
+                for item in filtered.get("disabled", [])
+                if (key := self._disabled_event_key(item)) is None or key not in notified
+            ]
+        return filtered
+
+    def _mark_disabled_accounts_notified(self, events: list[dict[str, Any]]) -> None:
+        keys = {key for item in events if (key := self._disabled_event_key(item))}
+        if not keys:
             return
+        with self._lock:
+            notified = set(self._state.setdefault("notified_disabled_accounts", []))
+            notified.update(keys)
+            self._state["notified_disabled_accounts"] = sorted(notified)
+            self._save_state()
 
-        def names_for(key: str) -> str:
-            names = [item["name"] for item in events.get(key, [])]
-            return ", ".join(names[:20]) if names else "-"
+    def notify_deleted_accounts(self, events: list[dict[str, Any]], *, test: bool = False) -> bool:
+        if not events:
+            return False
+        lines = [f"本轮删除: {len(events)} 个", "删除名单:"]
+        lines.extend(self._event_lines(events, include_status=True))
+        title = "[TEST] CPA Codex 删除通知" if test else "CPA Codex 删除通知"
+        return self.send(title, lines)
+
+    def notify_disabled_accounts(self, events: list[dict[str, Any]], *, test: bool = False) -> bool:
+        if not events:
+            return False
+        lines = [f"本轮禁用: {len(events)} 个", "禁用名单:"]
+        lines.extend(self._email_event_lines(events))
+        title = "[TEST] CPA Codex 禁用通知" if test else "CPA Codex 禁用通知"
+        sent = self.send(title, lines)
+        if sent and not test:
+            self._mark_disabled_accounts_notified(events)
+        return sent
+
+    def notify_status_broadcast(
+        self,
+        stats: dict[str, int],
+        events: dict[str, list[dict[str, Any]]],
+        quota_agg: dict[str, Any] | None,
+        *,
+        test: bool = False,
+    ) -> bool:
+        def event_summary(key: str) -> str:
+            values = events.get(key, [])
+            if not values:
+                return "-"
+            label_key = "email" if key == "disabled" else "name"
+            names = [str(item.get(label_key) or item.get("name") or "unknown") for item in values]
+            display = ", ".join(names[:20])
+            if len(names) > 20:
+                display += f" ... 另有 {len(names) - 20} 个"
+            return display
 
         lines = [
-            f"总计: {stats['total']}",
-            f"删除: {stats['dead']}",
-            f"禁用: {stats['disabled']}",
-            f"启用: {stats['enabled']}",
-            f"刷新: {stats['refreshed']}",
-            f"删除名单: {names_for('deleted')}",
-            f"禁用名单: {names_for('disabled')}",
-            f"启用名单: {names_for('enabled')}",
-            f"刷新名单: {names_for('refreshed')}",
+            "【账号巡检】",
+            f"总计: {stats.get('total', 0)}",
+            f"存活: {stats.get('alive', 0)}",
+            f"删除: {stats.get('dead', 0)}",
+            f"禁用: {stats.get('disabled', 0)}",
+            f"启用: {stats.get('enabled', 0)}",
+            f"刷新: {stats.get('refreshed', 0)}",
+            f"跳过: {stats.get('skipped', 0)}",
+            f"网络失败: {stats.get('network_error', 0)}",
+            "",
+            "【本轮名单摘要】",
+            f"删除名单: {event_summary('deleted')}",
+            f"禁用名单: {event_summary('disabled')}",
+            f"启用名单: {event_summary('enabled')}",
+            f"刷新名单: {event_summary('refreshed')}",
         ]
-        self.send("CPACodexKeeper 轮次变更通知", lines)
+        lines.append("")
+        if quota_agg:
+            lines.extend(build_daily_summary_lines(quota_agg))
+        else:
+            lines.extend(["【额度概况】", "Quota 信息不可用或未启用"])
+        title = "[TEST] CPA Codex 定时播报" if test else "CPA Codex 定时播报"
+        return self.send(title, lines)
 
     def notify_large_scale_usage_failure(self, stats: dict[str, int], events: dict[str, list[dict[str, Any]]]) -> None:
         names = [item["name"] for item in events.get("network_errors", [])]
@@ -191,6 +294,8 @@ class FeishuNotifier:
         )
 
     def handle_failure_state(self, stats: dict[str, int]) -> None:
+        if self.dry_run:
+            return
         send_recovery = False
         with self._lock:
             had_failures = stats["network_error"] > 0
@@ -223,30 +328,3 @@ class FeishuNotifier:
                 dedupe_key="consecutive-network-failure",
             )
 
-    def maybe_send_daily_summary(self, stats: dict[str, int]) -> None:
-        if not self.settings.notify_send_daily_summary or not self.enabled:
-            return
-        now = _utc_now()
-        hour = now.hour
-        if hour not in self.settings.notify_daily_summary_hours_utc:
-            return
-        with self._lock:
-            last_date = self._state.get("last_daily_summary_date")
-            last_slot = self._state.get("last_daily_summary_slot")
-            today = now.date().isoformat()
-            if last_date == today and last_slot == hour:
-                return
-            self._state["last_daily_summary_date"] = today
-            self._state["last_daily_summary_slot"] = hour
-            self._save_state()
-        lines = [
-            f"总计: {stats['total']}",
-            f"存活: {stats['alive']}",
-            f"删除: {stats['dead']}",
-            f"禁用: {stats['disabled']}",
-            f"启用: {stats['enabled']}",
-            f"刷新: {stats['refreshed']}",
-            f"跳过: {stats['skipped']}",
-            f"网络失败: {stats['network_error']}",
-        ]
-        self.send("CPACodexKeeper 日报", lines)

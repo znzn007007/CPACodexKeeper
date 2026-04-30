@@ -328,6 +328,10 @@ CPACodexKeeper/
 │  ├─ maintainer.py
 │  ├─ models.py
 │  ├─ openai_client.py
+│  ├─ notifier.py
+│  ├─ quota_job.py
+│  ├─ quota_report.py
+│  ├─ quota_state.py
 │  ├─ settings.py
 │  └─ utils.py
 ├─ tests/
@@ -342,7 +346,122 @@ CPACodexKeeper/
 
 ---
 
-## 12. 故障排查
+## 12. 定时播报与额度告警
+
+CPACodexKeeper 的飞书通知现在按“告警优先 + 定时播报”组织：
+
+- **实时通知**：删除 token、禁用 token、Plus 额度告警/恢复、CPA API 异常、usage 大面积失败、连续网络失败/恢复、巡检异常、进程异常退出。
+- **不再实时通知**：普通轮次变更、启用 token、刷新 token。它们会进入统一定时播报，避免每半小时刷屏。
+- **统一定时播报**：账号巡检统计和 quota 概况合并为一条 `CPA Codex 定时播报`。
+
+所有飞书标题都会自动带服务器名，例如 `[sub2api-prod] CPA Codex 定时播报`。多机部署时请为每台机器设置唯一 `CPA_SERVER_NAME`。
+
+### 12.1 定时播报内容
+
+定时播报包含：
+
+- 本轮账号统计：总计、存活、删除、禁用、启用、刷新、跳过、网络失败
+- 本轮名单摘要：删除、禁用、启用、刷新 token 名称；长名单会截断，完整细节看容器日志
+- quota 概况：总 auth、总可用、Plus / Free 平均剩余、最早重置时间、Unknown 数量
+
+Plus 额度告警默认触发条件：
+
+- `CPA_QUOTA_PLUS_EFFECTIVE_USABLE_LT=10`
+- `CPA_QUOTA_PLUS_AVG_REMAINING_5H_PERCENT_LT=30`
+- `CPA_QUOTA_PLUS_AVG_REMAINING_7D_PERCENT_LT=30`
+
+告警状态使用 `NORMAL -> ALERTING -> NORMAL` 状态机：进入告警只发一次，恢复只发一次，避免重复刷屏。
+
+### 12.2 配置
+
+```env
+CPA_SERVER_NAME=sub2api-prod
+CPA_STATUS_BROADCAST_ENABLED=true
+CPA_STATUS_BROADCAST_HOURS_LOCAL=8,12,18,23
+CPA_STATUS_BROADCAST_TIMEZONE=Asia/Hong_Kong
+
+CPA_QUOTA_REPORT_ENABLED=true
+CPA_QUOTA_ALERT_ENABLED=true
+CPA_QUOTA_PLUS_EFFECTIVE_USABLE_LT=10
+CPA_QUOTA_PLUS_AVG_REMAINING_5H_PERCENT_LT=30
+CPA_QUOTA_PLUS_AVG_REMAINING_7D_PERCENT_LT=30
+CPA_QUOTA_STATE_FILE=./runtime/quota_healthcheck_state.json
+```
+
+`CPA_STATUS_BROADCAST_HOURS_LOCAL` 是本地小时，多时段配置默认按东八区计算。旧的 `FEISHU_NOTIFY_SEND_DAILY_SUMMARY` 和 `FEISHU_NOTIFY_DAILY_SUMMARY_HOURS_UTC` 仍作为兼容输入保留，但新部署建议使用 `CPA_STATUS_BROADCAST_*`。
+
+### 12.3 状态文件
+
+Quota 告警状态和定时播报槽位单独写入：
+
+```text
+./runtime/quota_healthcheck_state.json
+```
+
+它不复用 `./runtime/notify_state.json`。这样可以避免 quota 告警/恢复、定时播报槽位污染 CPACodexKeeper 原有的网络失败和冷却状态。
+
+Docker 部署必须持久化 runtime：
+
+```yaml
+volumes:
+  - ./runtime:/app/runtime
+```
+
+### 12.4 本地运行和测试
+
+完整测试：
+
+```powershell
+python -m unittest discover -s tests
+```
+
+手动跑一轮 maintainer：
+
+```powershell
+python main.py --once --dry-run
+```
+
+受控飞书 transport 测试不会进入 maintainer 主流程，不会修改 CPA auth：
+
+```powershell
+python main.py --quota-test broadcast --quota-test-state-file .\runtime\quota_healthcheck_state.test.json
+python main.py --quota-test deleted --quota-test-state-file .\runtime\quota_healthcheck_state.test.json
+python main.py --quota-test disabled --quota-test-state-file .\runtime\quota_healthcheck_state.test.json
+python main.py --quota-test alert --quota-test-state-file .\runtime\quota_healthcheck_state.test.json
+python main.py --quota-test recovery --quota-test-state-file .\runtime\quota_healthcheck_state.test.json
+```
+
+如只想本地打印、不真实发飞书，加 `--dry-run`。
+
+### 12.5 线上调度边界
+
+正式服只允许一种调度源：现有 `cpacodexkeeper` daemon。Quota job 和定时播报都在每轮 `run()` 结束后执行，不需要额外 cron、sidecar 或第二个 maintainer。
+
+不要在 daemon 容器运行时再并行执行：
+
+```bash
+python main.py --once
+```
+
+如果确实需要一轮真实 maintainer one-off，必须先停止 daemon 容器，跑完后再恢复，并记录时间和命令。
+
+### 12.6 服务器部署和回滚要点
+
+部署前记录：
+
+- 当前 repo commit / branch / status
+- 当前 container id / image id
+- 当前 docker-compose 路径
+- `.env` 只记录 key，不打印值
+- `CPA_SERVER_NAME` 是否为当前机器的唯一名称
+- `quota_healthcheck_state.json` 如存在则单独备份
+- `notify_state.json` 默认只记录 path / checksum / mtime，不自动恢复
+
+回滚默认只恢复代码、compose/image，以及必要时恢复 `quota_healthcheck_state.json`。不要整目录恢复 `runtime/`，也不要默认恢复 `notify_state.json`，否则可能导致通知状态倒退或重复通知。
+
+---
+
+## 13. 故障排查
 
 ### 启动时报配置错误
 
@@ -372,7 +491,7 @@ CPACodexKeeper/
 
 ---
 
-## 13. 适用范围说明
+## 14. 适用范围说明
 
 这个项目面向**已授权的内部维护场景**，适合：
 

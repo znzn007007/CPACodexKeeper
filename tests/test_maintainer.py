@@ -21,6 +21,11 @@ class MaintainerTests(unittest.TestCase):
             expiry_threshold_days=3,
         )
         self.maintainer = CPACodexKeeper(settings=self.settings, dry_run=True)
+        self.maintainer.notifier.notify_deleted_accounts = Mock()
+        self.maintainer.notifier.notify_disabled_accounts = Mock()
+        self.maintainer.notifier.notify_status_broadcast = Mock(return_value=False)
+        self.maintainer.notifier.handle_failure_state = Mock()
+        self.maintainer.quota_job.run = Mock()
 
     def test_filter_tokens_keeps_only_codex_type(self):
         tokens = [
@@ -208,6 +213,33 @@ class MaintainerTests(unittest.TestCase):
         self.assertEqual(result, "alive")
         self.maintainer.set_disabled_status.assert_not_called()
         self.assertEqual(self.maintainer.stats.enabled, 0)
+
+    def test_process_token_uses_list_disabled_metadata_when_download_omits_it(self):
+        self.maintainer.get_token_detail = Mock(return_value={
+            "email": "a@example.com",
+            "access_token": "token",
+            "refresh_token": "rt",
+            "account_id": "acc",
+            "expired": "2099-01-01T00:00:00Z",
+        })
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "json": {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 100, "limit_window_seconds": 18000},
+                    "secondary_window": {"used_percent": 95, "limit_window_seconds": 604800},
+                },
+                "credits": {"has_credits": False},
+            }
+        }))
+        self.maintainer.set_disabled_status = Mock(return_value=True)
+
+        result = self.maintainer.process_token({"name": "t3-still-disabled", "disabled": True}, 1, 1)
+
+        self.assertEqual(result, "alive")
+        self.maintainer.set_disabled_status.assert_not_called()
+        self.assertEqual(self.maintainer.stats.disabled, 0)
+        self.assertEqual(self.maintainer.round_events["disabled"], [])
 
     def test_process_token_refreshes_disabled_token_when_near_expiry(self):
         self.maintainer.settings.enable_refresh = True
@@ -620,3 +652,136 @@ class MaintainerTests(unittest.TestCase):
         self.maintainer.run()
 
         self.maintainer.log.assert_any_call("INFO", "线程数: 5")
+
+    @patch("src.maintainer.random.shuffle", side_effect=lambda seq: None)
+    @patch("src.maintainer.as_completed")
+    @patch("src.maintainer.ThreadPoolExecutor")
+    def test_run_sends_merged_delete_notification_when_changes_exist(self, executor_cls, as_completed_mock, _shuffle_mock):
+        tokens = [{"name": "t1"}]
+        self.maintainer.get_token_list = Mock(return_value=tokens)
+        self.maintainer.log_startup = Mock()
+
+        def submit_side_effect(fn, token_info, idx, total):
+            future = Future()
+            future.set_result(fn(token_info, idx, total))
+            return future
+
+        executor = executor_cls.return_value.__enter__.return_value
+        executor.submit.side_effect = submit_side_effect
+        as_completed_mock.side_effect = lambda items: list(items)
+
+        def process_side_effect(token_info, idx, total):
+            self.maintainer._inc_stat("dead")
+            self.maintainer._record_event("deleted", {"name": "t1", "reason": "invalid"})
+            return "dead"
+
+        self.maintainer.process_token = Mock(side_effect=process_side_effect)
+
+        self.maintainer.run()
+
+        self.maintainer.notifier.notify_deleted_accounts.assert_called_once()
+
+
+    @patch("src.maintainer.random.shuffle", side_effect=lambda seq: None)
+    @patch("src.maintainer.as_completed")
+    @patch("src.maintainer.ThreadPoolExecutor")
+    def test_run_calls_quota_job_after_round(self, executor_cls, as_completed_mock, _shuffle_mock):
+        self.maintainer.get_token_list = Mock(return_value=[{"name": "t1"}])
+        executor = executor_cls.return_value.__enter__.return_value
+        future = Mock()
+        future.result.return_value = "alive"
+        executor.submit.return_value = future
+        as_completed_mock.return_value = [future]
+
+        self.maintainer.run()
+
+        self.maintainer.quota_job.run.assert_called_once()
+
+    def test_notify_post_run_sends_only_high_risk_account_realtime_notifications(self):
+        stats = {
+            "total": 4,
+            "alive": 1,
+            "dead": 1,
+            "disabled": 1,
+            "enabled": 1,
+            "refreshed": 1,
+            "skipped": 0,
+            "network_error": 0,
+        }
+        self.maintainer._record_event("deleted", {"name": "deleted-a", "reason": "invalid"})
+        self.maintainer._record_event("disabled", {"name": "disabled-a", "reason": "5h额度 100%"})
+        self.maintainer._record_event("enabled", {"name": "enabled-a"})
+        self.maintainer._record_event("refreshed", {"name": "refreshed-a"})
+
+        self.maintainer._notify_post_run(stats)
+
+        self.maintainer.notifier.notify_deleted_accounts.assert_called_once()
+        self.maintainer.notifier.notify_disabled_accounts.assert_called_once()
+
+    def test_process_token_records_quota_snapshot_without_mutating_from_alerts(self):
+        self.maintainer.get_token_detail = Mock(return_value={
+            "name": "t-plus",
+            "email": "p@example.com",
+            "access_token": "access",
+            "account_id": "acc",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "disabled": False,
+            "refresh_token": "rt",
+        })
+        self.maintainer.check_token_live = Mock(return_value=(200, {"json": {
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {"used_percent": 10, "limit_window_seconds": 18000, "reset_at": 2000},
+                "secondary_window": {"used_percent": 20, "limit_window_seconds": 604800, "reset_at": 3000},
+            },
+        }}))
+        self.maintainer.set_disabled_status = Mock(return_value=True)
+        self.maintainer.delete_token = Mock()
+        self.maintainer.try_refresh = Mock()
+
+        result = self.maintainer.process_token({"name": "t-plus"}, 1, 1)
+
+        self.assertEqual(result, "alive")
+        snapshots = self.maintainer._quota_snapshot_list()
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0]["account_type"], "plus")
+        self.assertTrue(snapshots[0]["effective_usable"])
+        self.maintainer.delete_token.assert_not_called()
+        self.maintainer.try_refresh.assert_not_called()
+
+    def test_process_token_records_unknown_quota_snapshot_on_usage_network_error(self):
+        self.maintainer.get_token_detail = Mock(return_value={
+            "name": "t-network",
+            "email": "n@example.com",
+            "access_token": "access",
+            "account_id": "acc",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "disabled": False,
+            "refresh_token": "rt",
+        })
+        self.maintainer.check_token_live = Mock(return_value=(None, {"brief": "timeout"}))
+
+        result = self.maintainer.process_token({"name": "t-network"}, 1, 1)
+
+        self.assertEqual(result, "network_error")
+        snapshots = self.maintainer._quota_snapshot_list()
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0]["account_type"], "unknown")
+        self.assertIn("网络检测失败", snapshots[0]["last_error"])
+
+    def test_dry_run_status_broadcast_does_not_consume_slot(self):
+        self.maintainer.notifier.notify_status_broadcast = Mock(return_value=True)
+        self.maintainer.quota_job.state.should_send_broadcast = Mock(return_value=True)
+        self.maintainer.quota_job.state.commit_broadcast = Mock()
+        self.maintainer.quota_job.state.save = Mock()
+
+        self.maintainer._maybe_send_status_broadcast(
+            {"total": 0, "alive": 0, "dead": 0, "disabled": 0, "enabled": 0, "refreshed": 0, "skipped": 0, "network_error": 0},
+            {},
+            None,
+        )
+
+        self.maintainer.notifier.notify_status_broadcast.assert_called_once()
+        self.maintainer.quota_job.state.commit_broadcast.assert_not_called()
+        self.maintainer.quota_job.state.save.assert_not_called()
+

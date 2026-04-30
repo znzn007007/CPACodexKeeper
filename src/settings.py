@@ -17,6 +17,18 @@ DEFAULT_NOTIFY_SEND_DAILY_SUMMARY = True
 DEFAULT_NOTIFY_FAILURE_THRESHOLD = 3
 DEFAULT_NOTIFY_LARGE_SCALE_USAGE_FAILURE_THRESHOLD = 5
 DEFAULT_NOTIFY_DAILY_SUMMARY_HOURS_UTC = (0, 3, 6, 9, 12, 15)
+DEFAULT_SERVER_NAME = "cpacodexkeeper"
+DEFAULT_STATUS_BROADCAST_ENABLED = True
+DEFAULT_STATUS_BROADCAST_HOURS_LOCAL = (8, 12, 18, 23)
+DEFAULT_STATUS_BROADCAST_TIMEZONE = "Asia/Hong_Kong"
+DEFAULT_CPA_QUOTA_REPORT_ENABLED = True
+DEFAULT_CPA_QUOTA_ALERT_ENABLED = True
+DEFAULT_CPA_QUOTA_SUMMARY_ENABLED = True
+DEFAULT_CPA_QUOTA_PLUS_EFFECTIVE_USABLE_LT = 10
+DEFAULT_CPA_QUOTA_PLUS_AVG_REMAINING_5H_PERCENT_LT = 30
+DEFAULT_CPA_QUOTA_PLUS_AVG_REMAINING_7D_PERCENT_LT = 30
+DEFAULT_CPA_QUOTA_SUMMARY_HOUR_LOCAL = 8
+DEFAULT_CPA_QUOTA_TIMEZONE = "Asia/Hong_Kong"
 PROJECT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
@@ -48,6 +60,19 @@ class Settings:
     notify_failure_threshold: int = DEFAULT_NOTIFY_FAILURE_THRESHOLD
     notify_large_scale_usage_failure_threshold: int = DEFAULT_NOTIFY_LARGE_SCALE_USAGE_FAILURE_THRESHOLD
     notify_state_file: str = "./runtime/notify_state.json"
+    server_name: str = DEFAULT_SERVER_NAME
+    status_broadcast_enabled: bool = DEFAULT_STATUS_BROADCAST_ENABLED
+    status_broadcast_hours_local: tuple[int, ...] = DEFAULT_STATUS_BROADCAST_HOURS_LOCAL
+    status_broadcast_timezone: str = DEFAULT_STATUS_BROADCAST_TIMEZONE
+    quota_report_enabled: bool = DEFAULT_CPA_QUOTA_REPORT_ENABLED
+    quota_alert_enabled: bool = DEFAULT_CPA_QUOTA_ALERT_ENABLED
+    quota_summary_enabled: bool = DEFAULT_CPA_QUOTA_SUMMARY_ENABLED
+    quota_plus_effective_usable_lt: int = DEFAULT_CPA_QUOTA_PLUS_EFFECTIVE_USABLE_LT
+    quota_plus_avg_remaining_5h_percent_lt: int = DEFAULT_CPA_QUOTA_PLUS_AVG_REMAINING_5H_PERCENT_LT
+    quota_plus_avg_remaining_7d_percent_lt: int = DEFAULT_CPA_QUOTA_PLUS_AVG_REMAINING_7D_PERCENT_LT
+    quota_summary_hour_local: int = DEFAULT_CPA_QUOTA_SUMMARY_HOUR_LOCAL
+    quota_timezone: str = DEFAULT_CPA_QUOTA_TIMEZONE
+    quota_state_file: str = "./runtime/quota_healthcheck_state.json"
 
 
 def _read_project_env_file(env_file: Path | None = None) -> dict[str, str]:
@@ -76,6 +101,13 @@ def _get_config_value(name: str, env_values: dict[str, str]) -> str | None:
     if env_value not in (None, ""):
         return env_value
     return env_values.get(name)
+
+
+def _has_config_value(name: str, env_values: dict[str, str]) -> bool:
+    env_value = os.getenv(name)
+    if env_value not in (None, ""):
+        return True
+    return env_values.get(name) not in (None, "")
 
 
 def _read_int(name: str, default: int, env_values: dict[str, str], *, minimum: int = 0, maximum: int | None = None) -> int:
@@ -135,6 +167,10 @@ def _read_csv_ints(
     return tuple(sorted(set(values)))
 
 
+def _legacy_utc_hours_to_east8_local(hours_utc: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(sorted({(hour + 8) % 24 for hour in hours_utc}))
+
+
 def load_settings(env_file: Path | None = None) -> Settings:
     env_values = _read_project_env_file(env_file)
     endpoint = (_get_config_value("CPA_ENDPOINT", env_values) or "").strip().rstrip("/")
@@ -153,6 +189,20 @@ def load_settings(env_file: Path | None = None) -> Settings:
     feishu_keyword = (_get_config_value("FEISHU_KEYWORD", env_values) or "").strip() or None
     feishu_secret = (_get_config_value("FEISHU_SECRET", env_values) or "").strip() or None
     notify_state_file = (_get_config_value("FEISHU_NOTIFY_STATE_FILE", env_values) or "./runtime/notify_state.json").strip()
+    quota_state_file = (_get_config_value("CPA_QUOTA_STATE_FILE", env_values) or "./runtime/quota_healthcheck_state.json").strip()
+    quota_timezone = (_get_config_value("CPA_QUOTA_TIMEZONE", env_values) or DEFAULT_CPA_QUOTA_TIMEZONE).strip()
+    server_name = (_get_config_value("CPA_SERVER_NAME", env_values) or DEFAULT_SERVER_NAME).strip()
+    status_broadcast_timezone = (
+        _get_config_value("CPA_STATUS_BROADCAST_TIMEZONE", env_values)
+        or _get_config_value("CPA_QUOTA_TIMEZONE", env_values)
+        or DEFAULT_STATUS_BROADCAST_TIMEZONE
+    ).strip()
+    if not server_name:
+        raise SettingsError("CPA_SERVER_NAME must not be empty")
+    if not status_broadcast_timezone:
+        raise SettingsError("CPA_STATUS_BROADCAST_TIMEZONE must not be empty")
+    if not quota_timezone:
+        raise SettingsError("CPA_QUOTA_TIMEZONE must not be empty")
 
     if feishu_security_mode not in {"none", "keyword", "secret"}:
         raise SettingsError("FEISHU_SECURITY_MODE must be one of: none, keyword, secret")
@@ -160,6 +210,41 @@ def load_settings(env_file: Path | None = None) -> Settings:
         raise SettingsError("FEISHU_KEYWORD is required when FEISHU_SECURITY_MODE=keyword")
     if feishu_webhook_url and feishu_security_mode == "secret" and not feishu_secret:
         raise SettingsError("FEISHU_SECRET is required when FEISHU_SECURITY_MODE=secret")
+
+    legacy_summary_hours = _read_csv_ints(
+        "FEISHU_NOTIFY_DAILY_SUMMARY_HOURS_UTC",
+        DEFAULT_NOTIFY_DAILY_SUMMARY_HOURS_UTC,
+        env_values,
+        minimum=0,
+        maximum=23,
+    )
+    if _has_config_value("CPA_STATUS_BROADCAST_HOURS_LOCAL", env_values):
+        status_broadcast_hours = _read_csv_ints(
+            "CPA_STATUS_BROADCAST_HOURS_LOCAL",
+            DEFAULT_STATUS_BROADCAST_HOURS_LOCAL,
+            env_values,
+            minimum=0,
+            maximum=23,
+        )
+    elif _has_config_value("FEISHU_NOTIFY_DAILY_SUMMARY_HOURS_UTC", env_values):
+        status_broadcast_hours = _legacy_utc_hours_to_east8_local(legacy_summary_hours)
+    else:
+        status_broadcast_hours = DEFAULT_STATUS_BROADCAST_HOURS_LOCAL
+
+    if _has_config_value("CPA_STATUS_BROADCAST_ENABLED", env_values):
+        status_broadcast_enabled = _read_bool(
+            "CPA_STATUS_BROADCAST_ENABLED",
+            DEFAULT_STATUS_BROADCAST_ENABLED,
+            env_values,
+        )
+    elif _has_config_value("FEISHU_NOTIFY_SEND_DAILY_SUMMARY", env_values):
+        status_broadcast_enabled = _read_bool(
+            "FEISHU_NOTIFY_SEND_DAILY_SUMMARY",
+            DEFAULT_STATUS_BROADCAST_ENABLED,
+            env_values,
+        )
+    else:
+        status_broadcast_enabled = DEFAULT_STATUS_BROADCAST_ENABLED
 
     return Settings(
         cpa_endpoint=endpoint,
@@ -180,13 +265,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         notify_cooldown_minutes=_read_int("FEISHU_NOTIFY_COOLDOWN_MINUTES", DEFAULT_NOTIFY_COOLDOWN_MINUTES, env_values, minimum=1),
         notify_send_recovery=_read_bool("FEISHU_NOTIFY_SEND_RECOVERY", DEFAULT_NOTIFY_SEND_RECOVERY, env_values),
         notify_send_daily_summary=_read_bool("FEISHU_NOTIFY_SEND_DAILY_SUMMARY", DEFAULT_NOTIFY_SEND_DAILY_SUMMARY, env_values),
-        notify_daily_summary_hours_utc=_read_csv_ints(
-            "FEISHU_NOTIFY_DAILY_SUMMARY_HOURS_UTC",
-            DEFAULT_NOTIFY_DAILY_SUMMARY_HOURS_UTC,
-            env_values,
-            minimum=0,
-            maximum=23,
-        ),
+        notify_daily_summary_hours_utc=legacy_summary_hours,
         notify_failure_threshold=_read_int(
             "FEISHU_NOTIFY_FAILURE_THRESHOLD",
             DEFAULT_NOTIFY_FAILURE_THRESHOLD,
@@ -200,4 +279,40 @@ def load_settings(env_file: Path | None = None) -> Settings:
             minimum=1,
         ),
         notify_state_file=notify_state_file,
+        server_name=server_name,
+        status_broadcast_enabled=status_broadcast_enabled,
+        status_broadcast_hours_local=status_broadcast_hours,
+        status_broadcast_timezone=status_broadcast_timezone,
+        quota_report_enabled=_read_bool("CPA_QUOTA_REPORT_ENABLED", DEFAULT_CPA_QUOTA_REPORT_ENABLED, env_values),
+        quota_alert_enabled=_read_bool("CPA_QUOTA_ALERT_ENABLED", DEFAULT_CPA_QUOTA_ALERT_ENABLED, env_values),
+        quota_summary_enabled=_read_bool("CPA_QUOTA_SUMMARY_ENABLED", DEFAULT_CPA_QUOTA_SUMMARY_ENABLED, env_values),
+        quota_plus_effective_usable_lt=_read_int(
+            "CPA_QUOTA_PLUS_EFFECTIVE_USABLE_LT",
+            DEFAULT_CPA_QUOTA_PLUS_EFFECTIVE_USABLE_LT,
+            env_values,
+            minimum=0,
+        ),
+        quota_plus_avg_remaining_5h_percent_lt=_read_int(
+            "CPA_QUOTA_PLUS_AVG_REMAINING_5H_PERCENT_LT",
+            DEFAULT_CPA_QUOTA_PLUS_AVG_REMAINING_5H_PERCENT_LT,
+            env_values,
+            minimum=0,
+            maximum=100,
+        ),
+        quota_plus_avg_remaining_7d_percent_lt=_read_int(
+            "CPA_QUOTA_PLUS_AVG_REMAINING_7D_PERCENT_LT",
+            DEFAULT_CPA_QUOTA_PLUS_AVG_REMAINING_7D_PERCENT_LT,
+            env_values,
+            minimum=0,
+            maximum=100,
+        ),
+        quota_summary_hour_local=_read_int(
+            "CPA_QUOTA_SUMMARY_HOUR_LOCAL",
+            DEFAULT_CPA_QUOTA_SUMMARY_HOUR_LOCAL,
+            env_values,
+            minimum=0,
+            maximum=23,
+        ),
+        quota_timezone=quota_timezone,
+        quota_state_file=quota_state_file,
     )
